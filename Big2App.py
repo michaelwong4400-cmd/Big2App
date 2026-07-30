@@ -1,429 +1,533 @@
-# server.py - Complete multiplayer server for Big 2
+import tkinter as tk
+from tkinter import messagebox, simpledialog
+import random
+from collections import Counter
+import math
 import asyncio
 import websockets
+import threading
 import json
-from collections import defaultdict
-import random
+import socket
 
-# Game constants (same as your client)
+# Core game logic
 SUITS = ['d', 'c', 'h', 's']
-RANKS = ['3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A', '2']
-RANK_ORDER = {r:i for i,r in enumerate(RANKS)}
+SUIT_NAMES = {'d':'Diamonds', 'c':'Clubs', 'h':'Hearts', 's':'Spades'}
 SUIT_ORDER = {'d':0, 'c':1, 'h':2, 's':3}
+RANKS = ['3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A', '2']
+RANK_NAMES = {'10':'10', 'J':'J', 'Q':'Q', 'K':'K', 'A':'A', '2':'2'}
+RANK_ORDER = {r:i for i,r in enumerate(RANKS)}
 
 class Card:
     def __init__(self, rank, suit):
         self.rank = rank
         self.suit = suit
-    
+
+    def __str__(self):
+        return f"{self.rank}{self.suit.upper()}"
+
+    def key(self):
+        return (RANK_ORDER[self.rank], SUIT_ORDER[self.suit])
+
+    def image_path(self):
+        r_disp = RANK_NAMES.get(self.rank, self.rank)
+        return f"cards/{r_disp}{self.suit.upper()}.png"
+
+    def __eq__(self, other):
+        return self.rank == other.rank and self.suit == other.suit
+
+    def __hash__(self):
+        return hash((self.rank, self.suit))
+
     def to_dict(self):
         return {"rank": self.rank, "suit": self.suit}
-    
+
     @classmethod
     def from_dict(cls, data):
         return cls(data["rank"], data["suit"])
 
-class GameRoom:
-    def __init__(self, room_id):
-        self.room_id = room_id
-        self.players = []  # List of (websocket, player_id, player_name)
-        self.game_state = {
-            "hands": [[] for _ in range(4)],
-            "current_player": 0,
-            "previous_move": None,
-            "passes": 0,
-            "last_played_cards": [],
-            "game_over": False,
-            "winner": None
-        }
-        self.game_started = False
-    
-    def add_player(self, websocket, player_name):
-        player_id = len(self.players)
-        self.players.append({
-            "websocket": websocket,
-            "id": player_id,
-            "name": player_name
-        })
-        return player_id
-    
-    def remove_player(self, websocket):
-        self.players = [p for p in self.players if p["websocket"] != websocket]
-    
-    def all_players_ready(self):
-        return len(self.players) == 4
-    
-    def start_game(self):
-        """Initialize the game when 4 players join"""
-        self.game_started = True
-        self.deal_cards()
-        self.broadcast_game_state()
-    
-    def deal_cards(self):
-        """Deal cards to all players"""
-        # Create and shuffle deck
-        deck = [Card(r, s) for s in SUITS for r in RANKS]
-        random.shuffle(deck)
-        
-        # Deal 13 cards to each player
-        hands = [[] for _ in range(4)]
-        for i in range(52):
-            hands[i % 4].append(deck[i])
-        
-        # Sort each hand
-        for hand in hands:
-            hand.sort(key=lambda c: (RANK_ORDER[c.rank], SUIT_ORDER[c.suit]))
-        
-        # Find who has 3 of diamonds (starts)
-        starter = -1
-        for i, hand in enumerate(hands):
-            if any(c.rank == '3' and c.suit == 'd' for c in hand):
-                starter = i
-                break
-        
-        self.game_state["hands"] = [[c.to_dict() for c in hand] for hand in hands]
-        self.game_state["current_player"] = starter
-    
-    def validate_move(self, player_id, selected_cards):
-        """Validate if a move is legal"""
-        if player_id != self.game_state["current_player"]:
-            return False, "Not your turn"
-        
-        if self.game_state["game_over"]:
-            return False, "Game is over"
-        
-        # Convert dict cards back to Card objects for validation
-        cards = [Card.from_dict(c) for c in selected_cards]
-        
-        # Get hand type
-        hand_type = self.get_hand_type(cards)
-        
-        # Check if beats previous move
-        if self.beats(hand_type, self.game_state["previous_move"]):
-            return True, hand_type
-        else:
-            return False, "Invalid play"
-    
-    def get_hand_type(self, cards):
-        """Same validation logic as client"""
-        if not cards:
-            return None
-        n = len(cards)
-        rank_count = defaultdict(int)
-        suit_count = defaultdict(int)
-        for c in cards:
-            rank_count[c.rank] += 1
-            suit_count[c.suit] += 1
-        counts = sorted(rank_count.values(), reverse=True)
-        
-        if n == 1:
-            return ('single', cards[0].key())
-        if n == 2 and counts == [2]:
-            return ('pair', max(cards, key=lambda c: c.key()).key())
-        if n == 3 and counts == [3]:
-            return ('triple', max(cards, key=lambda c: c.key()).key())
-        if n == 5:
-            ranks_idx = sorted(RANK_ORDER[c.rank] for c in cards)
-            is_seq = ranks_idx[4] - ranks_idx[0] == 4 and len(set(ranks_idx)) == 5
-            is_fl = len(set(c.suit for c in cards)) == 1
-            if is_seq and is_fl:
-                return ('straight_flush', max(cards, key=lambda c: c.key()).key())
-            if 4 in counts:
-                quad_r = next(r for r,c in rank_count.items() if c==4)
-                return ('four_kind', (RANK_ORDER[quad_r], 0))
-            if counts == [3,2]:
-                trip_r = next(r for r,c in rank_count.items() if c==3)
-                return ('full_house', (RANK_ORDER[trip_r], 0))
-            if is_fl:
-                return ('flush', max(cards, key=lambda c: c.key()).key())
-            if is_seq:
-                return ('straight', max(cards, key=lambda c: c.key()).key())
-        return None
-    
-    def beats(self, hand_type, prev_type):
-        """Same beat logic as client"""
-        if not prev_type:
-            return True
-        if not hand_type:
-            return False
-        t1, _ = hand_type
-        t2, _ = prev_type
-        type_order = {'single':0, 'pair':1, 'triple':2, 'straight':3, 
-                      'flush':4, 'full_house':5, 'four_kind':6, 'straight_flush':7}
-        if type_order.get(t1, -1) != type_order.get(t2, -1):
-            return type_order.get(t1, -1) > type_order.get(t2, -1)
-        return hand_type[1] > prev_type[1]
-    
-    def make_move(self, player_id, selected_cards):
-        """Execute a validated move"""
-        # Remove cards from player's hand
-        hand = [Card.from_dict(c) for c in self.game_state["hands"][player_id]]
-        cards_to_remove = [Card.from_dict(c) for c in selected_cards]
-        
-        for card in cards_to_remove:
-            for h_card in hand:
-                if h_card.rank == card.rank and h_card.suit == card.suit:
-                    hand.remove(h_card)
-                    break
-        
-        self.game_state["hands"][player_id] = [c.to_dict() for c in hand]
-        
-        # Update game state
-        hand_type = self.get_hand_type(cards_to_remove)
-        self.game_state["previous_move"] = hand_type
-        self.game_state["last_played_cards"] = selected_cards
-        self.game_state["passes"] = 0
-        
-        # Check win condition
-        if len(hand) == 0:
-            self.game_state["game_over"] = True
-            self.game_state["winner"] = player_id
-        else:
-            # Move to next player
-            self.game_state["current_player"] = (player_id + 1) % 4
-        
-        return True
-    
-    def make_pass(self, player_id):
-        """Execute a pass"""
-        self.game_state["passes"] += 1
-        
-        if self.game_state["passes"] >= 3:
-            self.game_state["previous_move"] = None
-            self.game_state["passes"] = 0
-        
-        self.game_state["current_player"] = (player_id + 1) % 4
-    
-    def broadcast_game_state(self):
-        """Send current game state to all players"""
-        message = {
-            "type": "game_state",
-            "game_state": self.game_state
-        }
-        
-        for player in self.players:
-            try:
-                # Send personalized view (hide other players' cards)
-                personalized_state = self.get_player_view(player["id"])
-                message["game_state"] = personalized_state
-                asyncio.create_task(player["websocket"].send(json.dumps(message)))
-            except:
-                pass
-    
-    def get_player_view(self, player_id):
-        """Return game state from specific player's perspective"""
-        state = self.game_state.copy()
-        
-        # Only show this player their own cards, others see card count only
-        state["player_id"] = player_id
-        state["your_hand"] = state["hands"][player_id]
-        state["hand_sizes"] = [len(hand) for hand in state["hands"]]
-        state["hands"] = None  # Don't send full hands to hide other players' cards
-        
-        return state
-
-class GameServer:
+class Big2App:
     def __init__(self):
-        self.rooms = {}  # room_id -> GameRoom
-        self.waiting_room = GameRoom("waiting")
-    def process_game_message(self, data):
-        if data["type"] == "game_state":
-            game_state = data["game_state"]
-            
-            # Check if game is waiting for players
-            if game_state.get("waiting_for_players", False):
-                self.show_waiting_screen(game_state)
-                return
-            
-            # Update local game state from server
-            self.current_player = game_state["current_player"]
-            self.previous_move = game_state["previous_move"]
-            self.passes = game_state["passes"]
-            self.game_over = game_state["game_over"]
-            self.game_started = game_state.get("game_started", True)
-            
-            # Update your hand (only your cards)
-            if "your_hand" in game_state:
-                # Convert dict cards back to Card objects
-                self.hands[self.player_id] = [Card(c["rank"], c["suit"]) for c in game_state["your_hand"]]
-            
-            # Update hand sizes display
-            self.hand_sizes = game_state["hand_sizes"]
-            self.num_players = game_state.get("num_players", 4)
-            
-            # Update last played cards display
-            if "last_played_cards" in game_state:
-                self.last_played_cards = [Card(c["rank"], c["suit"]) for c in game_state["last_played_cards"]]
-            
-            # Show player names if available
-            if "player_names" in game_state:
-                self.player_names = game_state["player_names"]
-            
-            # Redraw the UI
-            self.redraw()
-            
-            # Show winner if game over
-            if self.game_over:
-                winner = game_state.get("winner")
-                messagebox.showinfo("Game Over", f"Player {winner} wins!")
-        
-        elif data["type"] == "player_count":
-            players = data["players_in_room"]
-            min_players = data["min_players"]
-            game_started = data["game_started"]
-            
-            if not game_started:
-                self.status_label.config(
-                    text=f"Waiting for players... ({players}/{min_players}) connected. Game will start when {min_players} players join."
-                )
-        
-        elif data["type"] == "joined":
-            self.player_id = data["player_id"]
-            players = data["players_in_room"]
-            min_players = data["min_players"]
-            
-            messagebox.showinfo("Connected", 
-                f"Connected to server as Player {self.player_id}\n"
-                f"Players in room: {players}/{min_players}\n"
-                f"Waiting for {min_players - players} more player(s) to start..."
-            )
+        self.root = tk.Tk()
+        self.root.title("Big 2 Card Game - Multiplayer")
+        self.root.geometry("1200x800")
+        self.root.resizable(True, True)
 
-    def show_waiting_screen(self, game_state):
-        """Display a waiting screen until game starts"""
-        self.canvas.delete("all")
-        num_players = game_state.get("num_players", 0)
-        min_players = 2
-        
-        # Display waiting message
-        self.canvas.create_text(
-            self.canvas.winfo_width() // 2,
-            self.canvas.winfo_height() // 2 - 50,
-            text="Waiting for Game to Start",
-            font=("Arial", 24, "bold"),
-            fill="white"
-        )
-        
-        self.canvas.create_text(
-            self.canvas.winfo_width() // 2,
-            self.canvas.winfo_height() // 2,
-            text=f"Players connected: {num_players}/{min_players}",
-            font=("Arial", 18),
-            fill="white"
-        )
-        
-        if num_players < min_players:
-            self.canvas.create_text(
-                self.canvas.winfo_width() // 2,
-                self.canvas.winfo_height() // 2 + 50,
-                text=f"Waiting for {min_players - num_players} more player(s)...",
-                font=("Arial", 14),
-                fill="yellow"
-            )
-        
+        # Game state
+        self.deck = []
+        self.hands = [[] for _ in range(4)]
+        self.selected_cards = []
+        self.last_played_cards = []
+        self.current_player = 0
+        self.previous_move = None
+        self.passes = 0
+        self.game_over = False
+        self.starter_idx = 0
+        self.waiting_for_next_player = False
+        self.game_started = False
+        self.player_id = None
+        self.connected = False
+        self.websocket = None
+        self.hand_sizes = [0, 0, 0, 0]
+        self.player_names = []
+
+        # Canvas and UI
+        self.canvas = tk.Canvas(self.root, bg='green', width=1200, height=800)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.status_label = tk.Label(self.root, text="Not connected", font=("Arial", 16), bg='green', fg='white')
+        self.status_label.place(relx=0.5, rely=0.05, anchor='center')
+
+        # Buttons frame
+        btn_frame = tk.Frame(self.root, bg='green')
+        btn_frame.place(relx=0.5, rely=0.9, anchor='center')
+
+        self.pass_btn = tk.Button(btn_frame, text="Pass", command=self.pass_turn, width=10, font=("Arial", 12))
+        self.pass_btn.pack(side=tk.LEFT, padx=5)
+
+        self.play_btn = tk.Button(btn_frame, text="Play", command=self.play_selected, width=10, font=("Arial", 12))
+        self.play_btn.pack(side=tk.LEFT, padx=5)
+
+        self.new_game_btn = tk.Button(btn_frame, text="New Game", command=self.new_game, width=10, font=("Arial", 12))
+        self.new_game_btn.pack(side=tk.LEFT, padx=5)
+
+        self.next_player_btn = tk.Button(btn_frame, text="Next Player", command=self.next_player_manual, width=12, font=("Arial", 12), bg='lightblue')
+        self.next_player_btn.pack(side=tk.LEFT, padx=5)
+
+        self.connect_btn = tk.Button(btn_frame, text="Connect", command=self.show_connection_dialog, width=10, font=("Arial", 12), bg='lightgreen')
+        self.connect_btn.pack(side=tk.LEFT, padx=5)
+
+        self.bind_mouse()
+        self.new_game()  # initial local state
+        self.show_waiting_screen()  # show waiting until connected
+
+        self.root.mainloop()
+
+    def bind_mouse(self):
+        self.canvas.bind("<Button-1>", self.on_click)
+        self.root.bind("<Escape>", lambda e: self.clear_selection())
+
+    # ---------- Connection Methods ----------
+    def get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return "127.0.0.1"
+
+    def show_connection_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Connect to Game Server")
+        dialog.geometry("450x250")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(dialog, text="Server Address:", font=("Arial", 10)).pack(pady=5)
+        server_entry = tk.Entry(dialog, width=40)
+        server_entry.pack(pady=5)
+        server_entry.insert(0, f"ws://{self.get_local_ip()}:8765")
+
+        tk.Label(dialog, text="Your Name:", font=("Arial", 10)).pack(pady=5)
+        name_entry = tk.Entry(dialog, width=40)
+        name_entry.pack(pady=5)
+        name_entry.insert(0, f"Player")
+
+        def do_connect():
+            server = server_entry.get().strip()
+            player_name = name_entry.get().strip() or "Player"
+            dialog.destroy()
+            self.connect_to_server(server, player_name)
+
+        tk.Button(dialog, text="Connect", command=do_connect, width=15).pack(pady=15)
+        tk.Button(dialog, text="Cancel", command=dialog.destroy, width=10).pack()
+
+    def connect_to_server(self, server_address, player_name):
+        def run_async_connect():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._connect(server_address, player_name))
+            finally:
+                loop.close()
+
+        threading.Thread(target=run_async_connect, daemon=True).start()
+
+    async def _connect(self, server_address, player_name):
+        try:
+            self.websocket = await websockets.connect(server_address)
+            self.connected = True
+            self.root.after(0, lambda: messagebox.showinfo("Connected", f"Connected to server at {server_address}"))
+
+            # Send join message
+            await self.websocket.send(json.dumps({
+                "type": "join",
+                "player_name": player_name
+            }))
+
+            # Start listening for messages
+            async for message in self.websocket:
+                await self.handle_server_message(message)
+
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Connection Error", str(e)))
+            self.connected = False
+
+    async def handle_server_message(self, message):
+        try:
+            data = json.loads(message)
+            self.root.after(0, lambda: self.process_game_message(data))
+        except json.JSONDecodeError:
+            print("Invalid JSON from server")
+
+    def send_to_server(self, action_type, data):
+        if not self.connected or not self.websocket:
+            messagebox.showerror("Not Connected", "Not connected to server!")
+            return
+
+        def do_send():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                message = json.dumps({
+                    "type": action_type,
+                    "data": data
+                })
+                loop.run_until_complete(self.websocket.send(message))
+                loop.close()
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Send Error", str(e)))
+
+        threading.Thread(target=do_send, daemon=True).start()
+
+    # ---------- Game Logic (mostly from server, but keep local for fallback) ----------
+    def create_deck(self):
+        self.deck = [Card(r, s) for s in SUITS for r in RANKS]
+        random.shuffle(self.deck)
+
+    def deal(self):
+        # Local deal not used in multiplayer, but kept for new_game
+        self.create_deck()
+        for i in range(52 // 4):
+            for hand in self.hands:
+                if self.deck:
+                    hand.append(self.deck.pop())
+        leftover = self.deck
+        for h in self.hands:
+            h.sort(key=lambda c: c.key())
+        self.starter_idx = next(i for i, h in enumerate(self.hands) if Card('3','d') in h)
+        self.hands[self.starter_idx].extend(leftover)
+        self.hands[self.starter_idx].sort(key=lambda c: c.key())
+        self.current_player = self.starter_idx
+
+    def new_game(self):
+        # Local reset (mostly for offline testing, but not used in multiplayer)
+        self.hands = [[] for _ in range(4)]
+        self.selected_cards = []
+        self.last_played_cards = []
+        self.current_player = 0
+        self.previous_move = None
+        self.passes = 0
+        self.game_over = False
+        self.waiting_for_next_player = False
+        self.game_started = False
+        self.deal()
+        self.redraw()
         self.update_status()
 
+    # ---------- Event Handlers ----------
+    def on_click(self, event):
+        if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
+            return
+        # Only allow clicking on your own cards
+        if self.player_id is None:
+            return
+        x = event.x
+        y = event.y
+
+        if hasattr(self, 'card_rects') and len(self.card_rects) > self.player_id:
+            for rect, card in self.card_rects[self.player_id]:
+                left, top, right, bottom = rect
+                if left <= x <= right and top <= y <= bottom:
+                    if card in self.selected_cards:
+                        self.selected_cards.remove(card)
+                    else:
+                        self.selected_cards.append(card)
+                    self.redraw()
+                    break
+
     def play_selected(self):
-        """Modified to send move to server instead of processing locally"""
-        if not self.connected or self.game_over or self.waiting_for_next_player:
+        if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
             return
-        
-        if not self.game_started:
-            messagebox.showinfo("Waiting", "Game hasn't started yet!")
+        if self.player_id is None:
             return
-        
         if not self.selected_cards:
             messagebox.showerror("No Cards", "Please select cards to play!")
             return
-        
-        # Convert selected cards to serializable format
-        cards_data = [{"rank": c.rank, "suit": c.suit} for c in self.selected_cards]
-        
-        # Send to server
+
+        cards_data = [c.to_dict() for c in self.selected_cards]
         self.send_to_server("play", {
             "player_id": self.player_id,
             "selected_cards": cards_data
         })
-        
-        # Clear selection (will be redrawn when server confirms)
+        # Optimistically clear selection, will be redrawn on server response
         self.selected_cards = []
         self.waiting_for_next_player = True
         self.redraw()
 
     def pass_turn(self):
-        """Modified to send pass to server"""
-        if not self.connected or self.game_over or self.waiting_for_next_player:
+        if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
             return
-        
-        if not self.game_started:
-            messagebox.showinfo("Waiting", "Game hasn't started yet!")
+        if self.player_id is None:
             return
-        
         self.send_to_server("pass", {
             "player_id": self.player_id
         })
-        
         self.waiting_for_next_player = True
         self.redraw()
-        
-    async def handle_client(self, websocket, path):
-        """Handle a new client connection"""
-        print(f"New client connected")
-        
-        try:
-            # Assign to waiting room
-            player_name = None
-            
-            async for message in websocket:
-                data = json.loads(message)
-                
-                if data["type"] == "join":
-                    player_name = data.get("player_name", f"Player_{id(websocket)}")
-                    player_id = self.waiting_room.add_player(websocket, player_name)
-                    
-                    # Send acknowledgment
-                    await websocket.send(json.dumps({
-                        "type": "joined",
-                        "player_id": player_id,
-                        "players_in_room": len(self.waiting_room.players)
-                    }))
-                    
-                    # Check if we have 4 players
-                    if self.waiting_room.all_players_ready():
-                        print("Starting game with 4 players!")
-                        self.waiting_room.start_game()
-                        self.waiting_room.broadcast_game_state()
-                
-                elif data["type"] == "play" and self.waiting_room.game_started:
-                    player_id = data["player_id"]
-                    selected_cards = data["selected_cards"]
-                    
-                    valid, result = self.waiting_room.validate_move(player_id, selected_cards)
-                    if valid:
-                        self.waiting_room.make_move(player_id, selected_cards)
-                        self.waiting_room.broadcast_game_state()
-                    else:
-                        # Send error to just this player
-                        await websocket.send(json.dumps({
-                            "type": "error",
-                            "message": result
-                        }))
-                
-                elif data["type"] == "pass" and self.waiting_room.game_started:
-                    player_id = data["player_id"]
-                    self.waiting_room.make_pass(player_id)
-                    self.waiting_room.broadcast_game_state()
-        
-        except websockets.exceptions.ConnectionClosed:
-            print("Client disconnected")
-        finally:
-            self.waiting_room.remove_player(websocket)
 
-async def main():
-    server = GameServer()
-    async with websockets.serve(server.handle_client, "0.0.0.0", 8765):
-        print("Big 2 Game Server running on port 8765")
-        print("Waiting for players to connect...")
-        await asyncio.Future()
+    def next_player_manual(self):
+        # In multiplayer, next player is handled by server, but we keep this for local mode
+        if not self.connected:
+            # Fallback local next player
+            if self.game_over:
+                return
+            if self.passes >= 3:
+                self.previous_move = None
+                self.passes = 0
+            self.current_player = (self.current_player + 1) % 4
+            self.waiting_for_next_player = False
+            self.selected_cards = []
+            self.redraw()
+            self.update_status()
+            if len(self.hands[self.current_player]) == 0:
+                self.game_over = True
+                messagebox.showinfo("Game Over", f"Player {self.current_player} wins!")
+
+    def clear_selection(self):
+        self.selected_cards = []
+        self.redraw()
+
+    # ---------- Server Message Processing ----------
+    def process_game_message(self, data):
+        msg_type = data.get("type")
+
+        if msg_type == "joined":
+            self.player_id = data["player_id"]
+            players = data["players_in_room"]
+            min_players = data["min_players"]
+            waiting = data["waiting_for_players"]
+            self.status_label.config(text=f"Connected as Player {self.player_id}. Waiting for players... ({players}/{min_players})")
+            if waiting:
+                self.show_waiting_screen()
+            else:
+                # Game might have started immediately if enough players already
+                pass
+
+        elif msg_type == "player_count":
+            players = data["players_in_room"]
+            min_players = data["min_players"]
+            game_started = data["game_started"]
+            if not game_started:
+                self.status_label.config(text=f"Waiting for players... ({players}/{min_players})")
+                self.show_waiting_screen()
+            else:
+                # Game started
+                self.status_label.config(text=f"Game started! {players} players connected.")
+
+        elif msg_type == "game_state":
+            game_state = data["game_state"]
+            self.update_game_state(game_state)
+
+        elif msg_type == "error":
+            messagebox.showerror("Server Error", data.get("message", "Unknown error"))
+
+    def update_game_state(self, game_state):
+        # Update local copy from server
+        self.game_started = game_state.get("game_started", False)
+        if not self.game_started:
+            self.show_waiting_screen()
+            return
+
+        self.current_player = game_state["current_player"]
+        self.previous_move = game_state["previous_move"]
+        self.passes = game_state["passes"]
+        self.game_over = game_state["game_over"]
+        self.hand_sizes = game_state.get("hand_sizes", [0,0,0,0])
+        self.player_names = game_state.get("player_names", [])
+
+        # Update your hand
+        if "your_hand" in game_state and self.player_id is not None:
+            self.hands[self.player_id] = [Card.from_dict(c) for c in game_state["your_hand"]]
+
+        # Update last played cards
+        if "last_played_cards" in game_state:
+            self.last_played_cards = [Card.from_dict(c) for c in game_state["last_played_cards"]]
+
+        # Update other players' hand sizes (we don't have their cards)
+        # We'll use hand_sizes to display counts
+        self.redraw()
+        self.update_status()
+
+        if self.game_over:
+            winner = game_state.get("winner")
+            messagebox.showinfo("Game Over", f"Player {winner} wins!")
+
+    # ---------- Drawing ----------
+    def show_waiting_screen(self, message=None):
+        self.canvas.delete("all")
+        w = self.canvas.winfo_width() or 1200
+        h = self.canvas.winfo_height() or 800
+        self.canvas.create_text(w//2, h//2 - 50, text="Waiting for Game to Start", font=("Arial", 28, "bold"), fill="white")
+        if message:
+            self.canvas.create_text(w//2, h//2 + 20, text=message, font=("Arial", 18), fill="yellow")
+        else:
+            self.canvas.create_text(w//2, h//2 + 20, text="Connect to server and wait for enough players", font=("Arial", 18), fill="yellow")
+        self.update_status()
+
+    def redraw(self):
+        self.canvas.delete("all")
+        self.card_rects = [[] for _ in range(4)]
+
+        canvas_width = self.canvas.winfo_width() or 1200
+        canvas_height = self.canvas.winfo_height() or 800
+
+        positions = [(0.3, 0.15), (0.3, 0.35), (0.3, 0.55), (0.3, 0.75)]
+        card_w, card_h = 60, 90
+        scale = min(canvas_width/1200, canvas_height/800)
+        card_w *= scale
+        card_h *= scale
+
+        # Draw each player's hand (only show your own cards; others face-down)
+        for i in range(4):
+            x_rel, y_rel = positions[i]
+            x = x_rel * canvas_width
+            y = y_rel * canvas_height
+
+            # Draw player label
+            label = f"Player {i}"
+            if self.player_names and i < len(self.player_names):
+                label = self.player_names[i]
+            # Indicate if it's you
+            if self.player_id is not None and i == self.player_id:
+                label += " (you)"
+            self.canvas.create_text(x, y - card_h/2 - 20, text=label, font=("Arial", 12, "bold"), fill='white')
+
+            # Get hand for this player
+            if i == self.player_id:
+                hand = self.hands[i] if i < len(self.hands) else []
+            else:
+                # For other players, we don't have their cards, just show count
+                count = self.hand_sizes[i] if i < len(self.hand_sizes) else 0
+                # Draw a placeholder stack
+                if count > 0:
+                    self.canvas.create_text(x, y, text=f"{count} cards", font=("Arial", 14), fill="white")
+                else:
+                    self.canvas.create_text(x, y, text="(empty)", font=("Arial", 12), fill="white")
+                # Also draw back of cards for visual
+                for j in range(min(count, 3)):  # show up to 3 card backs
+                    cx = x - (j * 5) + 5
+                    cy = y - (j * 3) + 3
+                    self.draw_card(cx, cy, None, face_down=True, small=True)
+                continue
+
+            # Draw your hand
+            num_cards = len(hand)
+            if num_cards > 0:
+                total_width = (num_cards - 1) * card_w * 0.8 + card_w
+                start_x = x - total_width / 2
+                for j, card in enumerate(hand):
+                    cx = start_x + j * card_w * 0.8
+                    left = cx - card_w/2
+                    top = y - card_h/2
+                    right = cx + card_w/2
+                    bottom = y + card_h/2
+                    rect = (left, top, right, bottom)
+                    self.card_rects[i].append((rect, card))
+                    highlight = (i == self.player_id and card in self.selected_cards and self.game_started)
+                    self.draw_card(cx, y, card, highlight=highlight, face_down=False)
+            else:
+                self.canvas.create_text(x, y, text="(empty)", font=("Arial", 12), fill="white")
+
+        # Draw last played cards
+        if self.last_played_cards:
+            x = 0.7 * canvas_width
+            y = 0.45 * canvas_height
+            total_width = (len(self.last_played_cards) - 1) * card_w * 0.8 + card_w
+            start_x = x - total_width / 2
+            for j, card in enumerate(self.last_played_cards):
+                cx = start_x + j * card_w * 0.8
+                self.draw_card(cx, y, card, highlight=False, face_down=False)
+            self.canvas.create_text(x, y - card_h/2 - 10, text="Last Played:", font=("Arial", 12, "bold"), fill='white')
+
+        # Turn indicator
+        self.draw_turn_indicator()
+        self.update_status()
+
+    def draw_turn_indicator(self):
+        if not self.game_started:
+            return
+        positions = [(0.3, 0.15), (0.3, 0.35), (0.3, 0.55), (0.3, 0.75)]
+        canvas_width = self.canvas.winfo_width() or 1200
+        canvas_height = self.canvas.winfo_height() or 800
+        if self.current_player < len(positions):
+            x_rel, y_rel = positions[self.current_player]
+            x = x_rel * canvas_width
+            y = y_rel * canvas_height
+            self.canvas.create_rectangle(x - 150, y - 60, x + 150, y + 60,
+                                         outline='gold', width=3, dash=(5,5))
+
+    def draw_card(self, x, y, card, highlight=False, face_down=False, small=False):
+        canvas_width = self.canvas.winfo_width() or 1200
+        canvas_height = self.canvas.winfo_height() or 800
+        scale = min(canvas_width/1200, canvas_height/800)
+        w, h = 60, 90
+        if small:
+            scale *= 0.6
+        w *= scale
+        h *= scale
+
+        if face_down:
+            self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='blue', outline='white', width=2)
+            if not small:
+                self.canvas.create_text(x, y, text="?", font=('Arial', int(24*scale), 'bold'), fill='white')
+            return
+
+        if card is None:
+            # placeholder
+            self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='gray', outline='white')
+            return
+
+        color = 'black' if card.suit in ['s','c'] else 'red'
+        self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='white', outline=color, width=3)
+        if highlight:
+            self.canvas.create_rectangle(x-w/2+3, y-h/2+3, x+w/2-3, y+h/2-3, outline='yellow', width=4)
+
+        font_size = max(8, int(14*scale))
+        self.canvas.create_text(x-w/2+10*scale, y-h/2+10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
+        self.canvas.create_text(x+w/2-10*scale, y+h/2-10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
+        suit_sym = {'s':'♠', 'h':'♥', 'd':'♦', 'c':'♣'}[card.suit]
+        sym_size = max(10, int(20*scale))
+        self.canvas.create_text(x, y-h/2+25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
+        self.canvas.create_text(x, y+h/2-25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
+
+    def update_status(self):
+        if not self.connected:
+            self.status_label.config(text="Not connected to server. Click 'Connect' to join.")
+        elif self.game_over:
+            self.status_label.config(text="Game Over! Click 'New Game' to restart.")
+        elif not self.game_started:
+            self.status_label.config(text="Waiting for game to start...")
+        elif self.waiting_for_next_player:
+            self.status_label.config(text="Your turn is complete. Pass device or wait for others.")
+        else:
+            turn_player = self.current_player
+            is_your_turn = (self.player_id == turn_player)
+            turn_text = "YOUR TURN" if is_your_turn else f"Player {turn_player}'s turn"
+            self.status_label.config(
+                text=f"{turn_text} | Passes: {self.passes} | Cards: {self.hand_sizes}"
+            )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app = Big2App()
