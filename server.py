@@ -1,4 +1,4 @@
-# server.py - Complete Big 2 Multiplayer Server
+# server.py - Complete Big 2 Multiplayer Server (Fixed for newer websockets)
 import asyncio
 import websockets
 import json
@@ -272,7 +272,8 @@ class GameServer:
     def __init__(self):
         self.waiting_room = GameRoom("waiting")
     
-    async def handle_client(self, websocket, path):
+    # FIXED: Removed the 'path' parameter
+    async def handle_client(self, websocket):
         """Handle a new client connection"""
         print(f"New client connected")
         
@@ -357,6 +358,7 @@ class GameServer:
 
 async def main():
     server = GameServer()
+    # FIXED: Removed the 'path' parameter from serve()
     async with websockets.serve(server.handle_client, "0.0.0.0", 8765):
         print("=" * 60)
         print("🃏 BIG 2 MULTIPLAYER SERVER")
