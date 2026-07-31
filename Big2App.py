@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox
 import random
 from collections import Counter
 import math
@@ -69,6 +69,7 @@ class Big2App:
         self.websocket = None
         self.hand_sizes = [0, 0, 0, 0]
         self.player_names = []
+        self.is_my_turn = False
 
         # Canvas and UI
         self.canvas = tk.Canvas(self.root, bg='green', width=1200, height=800)
@@ -201,13 +202,12 @@ class Big2App:
 
         threading.Thread(target=do_send, daemon=True).start()
 
-    # ---------- Game Logic (mostly from server, but keep local for fallback) ----------
+    # ---------- Game Logic ----------
     def create_deck(self):
         self.deck = [Card(r, s) for s in SUITS for r in RANKS]
         random.shuffle(self.deck)
 
     def deal(self):
-        # Local deal not used in multiplayer, but kept for new_game
         self.create_deck()
         for i in range(52 // 4):
             for hand in self.hands:
@@ -222,7 +222,6 @@ class Big2App:
         self.current_player = self.starter_idx
 
     def new_game(self):
-        # Local reset (mostly for offline testing, but not used in multiplayer)
         self.hands = [[] for _ in range(4)]
         self.selected_cards = []
         self.last_played_cards = []
@@ -240,9 +239,14 @@ class Big2App:
     def on_click(self, event):
         if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
             return
-        # Only allow clicking on your own cards
+        
         if self.player_id is None:
             return
+            
+        # Check if it's your turn
+        if self.current_player != self.player_id:
+            return
+            
         x = event.x
         y = event.y
 
@@ -260,18 +264,28 @@ class Big2App:
     def play_selected(self):
         if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
             return
+        
         if self.player_id is None:
             return
+            
+        # Check if it's your turn
+        if self.current_player != self.player_id:
+            messagebox.showinfo("Not Your Turn", "Please wait for your turn!")
+            return
+            
         if not self.selected_cards:
             messagebox.showerror("No Cards", "Please select cards to play!")
             return
 
         cards_data = [c.to_dict() for c in self.selected_cards]
+        
+        # Send to server
         self.send_to_server("play", {
             "player_id": self.player_id,
             "selected_cards": cards_data
         })
-        # Optimistically clear selection, will be redrawn on server response
+        
+        # Clear selection locally (will be updated when server responds)
         self.selected_cards = []
         self.waiting_for_next_player = True
         self.redraw()
@@ -279,8 +293,15 @@ class Big2App:
     def pass_turn(self):
         if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
             return
+        
         if self.player_id is None:
             return
+            
+        # Check if it's your turn
+        if self.current_player != self.player_id:
+            messagebox.showinfo("Not Your Turn", "Please wait for your turn!")
+            return
+            
         self.send_to_server("pass", {
             "player_id": self.player_id
         })
@@ -288,9 +309,9 @@ class Big2App:
         self.redraw()
 
     def next_player_manual(self):
-        # In multiplayer, next player is handled by server, but we keep this for local mode
+        # In multiplayer, next player is handled by server
+        # This is only for local/fallback mode
         if not self.connected:
-            # Fallback local next player
             if self.game_over:
                 return
             if self.passes >= 3:
@@ -322,7 +343,6 @@ class Big2App:
             if waiting:
                 self.show_waiting_screen()
             else:
-                # Game might have started immediately if enough players already
                 pass
 
         elif msg_type == "player_count":
@@ -333,7 +353,6 @@ class Big2App:
                 self.status_label.config(text=f"Waiting for players... ({players}/{min_players})")
                 self.show_waiting_screen()
             else:
-                # Game started
                 self.status_label.config(text=f"Game started! {players} players connected.")
 
         elif msg_type == "game_state":
@@ -346,27 +365,43 @@ class Big2App:
     def update_game_state(self, game_state):
         # Update local copy from server
         self.game_started = game_state.get("game_started", False)
+        
         if not self.game_started:
             self.show_waiting_screen()
             return
 
+        # Update game state
         self.current_player = game_state["current_player"]
         self.previous_move = game_state["previous_move"]
         self.passes = game_state["passes"]
         self.game_over = game_state["game_over"]
-        self.hand_sizes = game_state.get("hand_sizes", [0,0,0,0])
+        self.hand_sizes = game_state.get("hand_sizes", [0, 0, 0, 0])
         self.player_names = game_state.get("player_names", [])
+        
+        # Check if it's your turn
+        if self.player_id is not None:
+            self.is_my_turn = (self.current_player == self.player_id)
+            # Reset waiting flag if it's your turn
+            if self.is_my_turn:
+                self.waiting_for_next_player = False
 
-        # Update your hand
+        # Update your hand (this is the key part - cards are removed by the server)
         if "your_hand" in game_state and self.player_id is not None:
-            self.hands[self.player_id] = [Card.from_dict(c) for c in game_state["your_hand"]]
+            new_hand = [Card.from_dict(c) for c in game_state["your_hand"]]
+            self.hands[self.player_id] = new_hand
+            
+            # Debug: Print hand size after update
+            print(f"Your hand now has {len(self.hands[self.player_id])} cards")
 
         # Update last played cards
         if "last_played_cards" in game_state:
             self.last_played_cards = [Card.from_dict(c) for c in game_state["last_played_cards"]]
 
-        # Update other players' hand sizes (we don't have their cards)
-        # We'll use hand_sizes to display counts
+        # Clear selection if it's not your turn or game is over
+        if not self.is_my_turn or self.game_over:
+            self.selected_cards = []
+
+        # Redraw the UI
         self.redraw()
         self.update_status()
 
@@ -399,7 +434,7 @@ class Big2App:
         card_w *= scale
         card_h *= scale
 
-        # Draw each player's hand (only show your own cards; others face-down)
+        # Draw each player's hand
         for i in range(4):
             x_rel, y_rel = positions[i]
             x = x_rel * canvas_width
@@ -409,46 +444,56 @@ class Big2App:
             label = f"Player {i}"
             if self.player_names and i < len(self.player_names):
                 label = self.player_names[i]
-            # Indicate if it's you
             if self.player_id is not None and i == self.player_id:
                 label += " (you)"
+            if self.game_started and self.current_player == i:
+                label += " ←"
             self.canvas.create_text(x, y - card_h/2 - 20, text=label, font=("Arial", 12, "bold"), fill='white')
 
             # Get hand for this player
             if i == self.player_id:
+                # Your hand - show all cards
                 hand = self.hands[i] if i < len(self.hands) else []
+                
+                # Draw hand size indicator
+                self.canvas.create_text(x, y + card_h/2 + 20, text=f"{len(hand)} cards", font=("Arial", 10), fill="white")
+                
+                if len(hand) > 0:
+                    total_width = (len(hand) - 1) * card_w * 0.8 + card_w
+                    start_x = x - total_width / 2
+                    for j, card in enumerate(hand):
+                        cx = start_x + j * card_w * 0.8
+                        left = cx - card_w/2
+                        top = y - card_h/2
+                        right = cx + card_w/2
+                        bottom = y + card_h/2
+                        rect = (left, top, right, bottom)
+                        self.card_rects[i].append((rect, card))
+                        
+                        # Only highlight if it's your turn and game is active
+                        can_highlight = (self.game_started and not self.game_over and 
+                                       self.current_player == self.player_id and not self.waiting_for_next_player)
+                        highlight = can_highlight and card in self.selected_cards
+                        self.draw_card(cx, y, card, highlight=highlight, face_down=False)
+                else:
+                    self.canvas.create_text(x, y, text="(empty hand)", font=("Arial", 14, "bold"), fill="white")
             else:
-                # For other players, we don't have their cards, just show count
+                # Other players - show only count
                 count = self.hand_sizes[i] if i < len(self.hand_sizes) else 0
-                # Draw a placeholder stack
+                self.canvas.create_text(x, y + card_h/2 + 20, text=f"{count} cards", font=("Arial", 10), fill="white")
+                
                 if count > 0:
-                    self.canvas.create_text(x, y, text=f"{count} cards", font=("Arial", 14), fill="white")
+                    # Draw stacked card backs (up to 3)
+                    num_to_show = min(count, 3)
+                    for j in range(num_to_show):
+                        offset_x = (j - (num_to_show - 1) / 2) * 15 * scale
+                        offset_y = (j - (num_to_show - 1) / 2) * 3 * scale
+                        self.draw_card(x + offset_x, y + offset_y, None, face_down=True, small=True)
+                    
+                    if count > 3:
+                        self.canvas.create_text(x + 30*scale, y, text=f"+{count - 3}", font=("Arial", 10), fill="white")
                 else:
                     self.canvas.create_text(x, y, text="(empty)", font=("Arial", 12), fill="white")
-                # Also draw back of cards for visual
-                for j in range(min(count, 3)):  # show up to 3 card backs
-                    cx = x - (j * 5) + 5
-                    cy = y - (j * 3) + 3
-                    self.draw_card(cx, cy, None, face_down=True, small=True)
-                continue
-
-            # Draw your hand
-            num_cards = len(hand)
-            if num_cards > 0:
-                total_width = (num_cards - 1) * card_w * 0.8 + card_w
-                start_x = x - total_width / 2
-                for j, card in enumerate(hand):
-                    cx = start_x + j * card_w * 0.8
-                    left = cx - card_w/2
-                    top = y - card_h/2
-                    right = cx + card_w/2
-                    bottom = y + card_h/2
-                    rect = (left, top, right, bottom)
-                    self.card_rects[i].append((rect, card))
-                    highlight = (i == self.player_id and card in self.selected_cards and self.game_started)
-                    self.draw_card(cx, y, card, highlight=highlight, face_down=False)
-            else:
-                self.canvas.create_text(x, y, text="(empty)", font=("Arial", 12), fill="white")
 
         # Draw last played cards
         if self.last_played_cards:
@@ -462,7 +507,9 @@ class Big2App:
             self.canvas.create_text(x, y - card_h/2 - 10, text="Last Played:", font=("Arial", 12, "bold"), fill='white')
 
         # Turn indicator
-        self.draw_turn_indicator()
+        if self.game_started and not self.game_over:
+            self.draw_turn_indicator()
+        
         self.update_status()
 
     def draw_turn_indicator(self):
@@ -520,14 +567,20 @@ class Big2App:
         elif not self.game_started:
             self.status_label.config(text="Waiting for game to start...")
         elif self.waiting_for_next_player:
-            self.status_label.config(text="Your turn is complete. Pass device or wait for others.")
+            self.status_label.config(text="Waiting for other players to take their turn...")
         else:
             turn_player = self.current_player
             is_your_turn = (self.player_id == turn_player)
-            turn_text = "YOUR TURN" if is_your_turn else f"Player {turn_player}'s turn"
-            self.status_label.config(
-                text=f"{turn_text} | Passes: {self.passes} | Cards: {self.hand_sizes}"
-            )
+            if is_your_turn:
+                turn_text = "🎯 YOUR TURN - Select cards and click Play"
+                self.status_label.config(
+                    text=f"{turn_text} | Passes: {self.passes} | Your cards: {len(self.hands[self.player_id]) if self.player_id is not None else '?'}"
+                )
+            else:
+                turn_text = f"Player {turn_player}'s turn"
+                self.status_label.config(
+                    text=f"{turn_text} | Passes: {self.passes} | Your cards: {len(self.hands[self.player_id]) if self.player_id is not None else '?'}"
+                )
 
 if __name__ == "__main__":
     app = Big2App()
