@@ -9,6 +9,9 @@ import threading
 import json
 import socket
 
+#UPDATE:
+
+
 # Core game logic
 SUITS = ['d', 'c', 'h', 's']
 SUIT_NAMES = {'d':'Diamonds', 'c':'Clubs', 'h':'Hearts', 's':'Spades'}
