@@ -9,9 +9,6 @@ import threading
 import json
 import socket
 
-#UPDATE:
-
-
 # Core game logic
 SUITS = ['d', 'c', 'h', 's']
 SUIT_NAMES = {'d':'Diamonds', 'c':'Clubs', 'h':'Hearts', 's':'Spades'}
@@ -73,6 +70,13 @@ class Big2App:
         self.hand_sizes = [0, 0, 0, 0]
         self.player_names = []
         self.is_my_turn = False
+        self.num_players = 4
+        
+        # CRITICAL: This MUST be set by the server
+        self.must_play_three_diamonds = False
+        
+        # Track if the game has started and 3D has been played
+        self.three_diamonds_played_in_game = False
 
         # Canvas and UI
         self.canvas = tk.Canvas(self.root, bg='green', width=1200, height=800)
@@ -94,15 +98,11 @@ class Big2App:
         self.new_game_btn = tk.Button(btn_frame, text="New Game", command=self.new_game, width=10, font=("Arial", 12))
         self.new_game_btn.pack(side=tk.LEFT, padx=5)
 
-        self.next_player_btn = tk.Button(btn_frame, text="Next Player", command=self.next_player_manual, width=12, font=("Arial", 12), bg='lightblue')
-        self.next_player_btn.pack(side=tk.LEFT, padx=5)
-
         self.connect_btn = tk.Button(btn_frame, text="Connect", command=self.show_connection_dialog, width=10, font=("Arial", 12), bg='lightgreen')
         self.connect_btn.pack(side=tk.LEFT, padx=5)
 
         self.bind_mouse()
-        self.new_game()  # initial local state
-        self.show_waiting_screen()  # show waiting until connected
+        self.show_waiting_screen()
 
         self.root.mainloop()
 
@@ -136,7 +136,7 @@ class Big2App:
         tk.Label(dialog, text="Your Name:", font=("Arial", 10)).pack(pady=5)
         name_entry = tk.Entry(dialog, width=40)
         name_entry.pack(pady=5)
-        name_entry.insert(0, f"Player")
+        name_entry.insert(0, "Player")
 
         def do_connect():
             server = server_entry.get().strip()
@@ -162,15 +162,13 @@ class Big2App:
         try:
             self.websocket = await websockets.connect(server_address)
             self.connected = True
-            self.root.after(0, lambda: messagebox.showinfo("Connected", f"Connected to server at {server_address}"))
+            self.root.after(0, lambda: messagebox.showinfo("Connected", f"Connected to server"))
 
-            # Send join message
             await self.websocket.send(json.dumps({
                 "type": "join",
                 "player_name": player_name
             }))
 
-            # Start listening for messages
             async for message in self.websocket:
                 await self.handle_server_message(message)
 
@@ -206,24 +204,6 @@ class Big2App:
         threading.Thread(target=do_send, daemon=True).start()
 
     # ---------- Game Logic ----------
-    def create_deck(self):
-        self.deck = [Card(r, s) for s in SUITS for r in RANKS]
-        random.shuffle(self.deck)
-
-    def deal(self):
-        self.create_deck()
-        for i in range(52 // 4):
-            for hand in self.hands:
-                if self.deck:
-                    hand.append(self.deck.pop())
-        leftover = self.deck
-        for h in self.hands:
-            h.sort(key=lambda c: c.key())
-        self.starter_idx = next(i for i, h in enumerate(self.hands) if Card('3','d') in h)
-        self.hands[self.starter_idx].extend(leftover)
-        self.hands[self.starter_idx].sort(key=lambda c: c.key())
-        self.current_player = self.starter_idx
-
     def new_game(self):
         self.hands = [[] for _ in range(4)]
         self.selected_cards = []
@@ -234,7 +214,8 @@ class Big2App:
         self.game_over = False
         self.waiting_for_next_player = False
         self.game_started = False
-        self.deal()
+        self.must_play_three_diamonds = False
+        self.three_diamonds_played_in_game = False
         self.redraw()
         self.update_status()
 
@@ -246,32 +227,68 @@ class Big2App:
         if self.player_id is None:
             return
             
-        # Check if it's your turn
         if self.current_player != self.player_id:
             return
             
         x = event.x
         y = event.y
 
+        # Check each card rectangle for the current player
         if hasattr(self, 'card_rects') and len(self.card_rects) > self.player_id:
-            for rect, card in self.card_rects[self.player_id]:
+            for rect, card in reversed(self.card_rects[self.player_id]):
                 left, top, right, bottom = rect
-                if left <= x <= right and top <= y <= bottom:
-                    if card in self.selected_cards:
-                        self.selected_cards.remove(card)
+                padding = 5
+                if (left - padding) <= x <= (right + padding) and (top - padding) <= y <= (bottom + padding):
+                    is_three_diamonds = (card.rank == '3' and card.suit == 'd')
+                    
+                    # CRITICAL FIX: Check if 3D must be played
+                    if self.must_play_three_diamonds:
+                        print(f"DEBUG: must_play_three_diamonds is TRUE - enforcing 3D rule")
+                        
+                        # Only allow selecting 3 of diamonds first
+                        if is_three_diamonds:
+                            # Select ONLY the 3 of diamonds
+                            self.selected_cards = [card]
+                            self.status_label.config(text="✅ 3♦ selected! Now add other cards for your play")
+                            self.redraw()
+                            break
+                        else:
+                            # Check if 3D is already selected
+                            has_3d = any(c.rank == '3' and c.suit == 'd' for c in self.selected_cards)
+                            if has_3d:
+                                # 3D is selected, allow toggling other cards
+                                if card in self.selected_cards:
+                                    self.selected_cards.remove(card)
+                                else:
+                                    self.selected_cards.append(card)
+                                self.redraw()
+                                break
+                            else:
+                                # 3D not selected - block selection
+                                messagebox.showwarning(
+                                    "3 of Diamonds Required!",
+                                    "You MUST select the 3♦ card first!\n\n"
+                                    "Click on the 3♦ card (it has a red border) before selecting other cards."
+                                )
+                                self.redraw()
+                                break
                     else:
-                        self.selected_cards.append(card)
-                    self.redraw()
-                    break
+                        # Normal selection
+                        if card in self.selected_cards:
+                            self.selected_cards.remove(card)
+                        else:
+                            self.selected_cards.append(card)
+                        self.redraw()
+                        break
 
     def play_selected(self):
+        # CRITICAL FIX: Check 3D rule BEFORE anything else
         if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
             return
         
         if self.player_id is None:
             return
             
-        # Check if it's your turn
         if self.current_player != self.player_id:
             messagebox.showinfo("Not Your Turn", "Please wait for your turn!")
             return
@@ -280,18 +297,33 @@ class Big2App:
             messagebox.showerror("No Cards", "Please select cards to play!")
             return
 
+        # CRITICAL FIX: Enforce 3D rule here
+        if self.must_play_three_diamonds:
+            print(f"DEBUG: play_selected - must_play_three_diamonds is TRUE")
+            has_three_diamonds = any(c.rank == '3' and c.suit == 'd' for c in self.selected_cards)
+            
+            if not has_three_diamonds:
+                messagebox.showerror(
+                    "❌ 3 of Diamonds Required!",
+                    "You MUST include the 3 of diamonds in your play!\n\n"
+                    "This is the first play of the game.\n"
+                    "Select the 3♦ card and try again."
+                )
+                self.selected_cards = []
+                self.redraw()
+                return
+            
+            print(f"DEBUG: 3D found in selection - proceeding")
+        
         cards_data = [c.to_dict() for c in self.selected_cards]
         
-        # Send to server
         self.send_to_server("play", {
             "player_id": self.player_id,
             "selected_cards": cards_data
         })
         
-        # Clear selection locally (will be updated when server responds)
-        self.selected_cards = []
-        self.waiting_for_next_player = True
-        self.redraw()
+        self.play_btn.config(state='disabled')
+        self.pass_btn.config(state='disabled')
 
     def pass_turn(self):
         if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
@@ -300,34 +332,28 @@ class Big2App:
         if self.player_id is None:
             return
             
-        # Check if it's your turn
         if self.current_player != self.player_id:
             messagebox.showinfo("Not Your Turn", "Please wait for your turn!")
             return
+        
+        # CRITICAL FIX: Block pass if 3D must be played
+        if self.must_play_three_diamonds:
+            hand = self.hands[self.player_id] if self.player_id < len(self.hands) else []
+            has_three_diamonds = any(c.rank == '3' and c.suit == 'd' for c in hand)
+            if has_three_diamonds:
+                messagebox.showerror(
+                    "❌ Cannot Pass!",
+                    "You MUST play the 3 of diamonds!\n\n"
+                    "You have the 3♦ and must play it first.\n"
+                    "Click on the 3♦ card, select additional cards if desired, then click Play."
+                )
+                return
             
         self.send_to_server("pass", {
             "player_id": self.player_id
         })
         self.waiting_for_next_player = True
         self.redraw()
-
-    def next_player_manual(self):
-        # In multiplayer, next player is handled by server
-        # This is only for local/fallback mode
-        if not self.connected:
-            if self.game_over:
-                return
-            if self.passes >= 3:
-                self.previous_move = None
-                self.passes = 0
-            self.current_player = (self.current_player + 1) % 4
-            self.waiting_for_next_player = False
-            self.selected_cards = []
-            self.redraw()
-            self.update_status()
-            if len(self.hands[self.current_player]) == 0:
-                self.game_over = True
-                messagebox.showinfo("Game Over", f"Player {self.current_player} wins!")
 
     def clear_selection(self):
         self.selected_cards = []
@@ -345,8 +371,6 @@ class Big2App:
             self.status_label.config(text=f"Connected as Player {self.player_id}. Waiting for players... ({players}/{min_players})")
             if waiting:
                 self.show_waiting_screen()
-            else:
-                pass
 
         elif msg_type == "player_count":
             players = data["players_in_room"]
@@ -363,48 +387,85 @@ class Big2App:
             self.update_game_state(game_state)
 
         elif msg_type == "error":
-            messagebox.showerror("Server Error", data.get("message", "Unknown error"))
+            error_msg = data.get("message", "Unknown error")
+            
+            if "3 of diamonds" in error_msg.lower() or "3♦" in error_msg:
+                messagebox.showerror("❌ 3 of Diamonds Required!", 
+                    f"{error_msg}\n\n"
+                    "Remember: The first play MUST include the 3 of diamonds (3♦)!")
+                # Auto-select 3D for the player
+                if self.player_id is not None and self.player_id < len(self.hands):
+                    for card in self.hands[self.player_id]:
+                        if card.rank == '3' and card.suit == 'd':
+                            self.selected_cards = [card]
+                            break
+            else:
+                messagebox.showerror("Invalid Play", error_msg)
+            
+            self.waiting_for_next_player = False
+            self.play_btn.config(state='normal')
+            self.pass_btn.config(state='normal')
+            self.redraw()
 
     def update_game_state(self, game_state):
-        # Update local copy from server
         self.game_started = game_state.get("game_started", False)
         
         if not self.game_started:
             self.show_waiting_screen()
             return
 
-        # Update game state
         self.current_player = game_state["current_player"]
         self.previous_move = game_state["previous_move"]
         self.passes = game_state["passes"]
         self.game_over = game_state["game_over"]
         self.hand_sizes = game_state.get("hand_sizes", [0, 0, 0, 0])
         self.player_names = game_state.get("player_names", [])
+        self.num_players = game_state.get("num_players", 4)
         
-        # Check if it's your turn
+        # CRITICAL FIX: Update the 3D flag from server
+        self.must_play_three_diamonds = game_state.get("must_play_three_diamonds", False)
+        
+        print(f"DEBUG: update_game_state - must_play_three_diamonds = {self.must_play_three_diamonds}")
+        
         if self.player_id is not None:
             self.is_my_turn = (self.current_player == self.player_id)
-            # Reset waiting flag if it's your turn
             if self.is_my_turn:
                 self.waiting_for_next_player = False
+                self.play_btn.config(state='normal')
+                self.pass_btn.config(state='normal')
+                
+                # If 3D must be played, auto-select it
+                if self.must_play_three_diamonds and self.player_id < len(self.hands):
+                    self.selected_cards = []
+                    for card in self.hands[self.player_id]:
+                        if card.rank == '3' and card.suit == 'd':
+                            self.selected_cards = [card]
+                            print(f"DEBUG: Auto-selected 3D for player {self.player_id}")
+                            break
+                    self.status_label.config(text="🔴 3♦ auto-selected! Click Play to play it, or add more cards")
+            else:
+                self.waiting_for_next_player = True
+                self.play_btn.config(state='disabled')
+                self.pass_btn.config(state='disabled')
 
-        # Update your hand (this is the key part - cards are removed by the server)
         if "your_hand" in game_state and self.player_id is not None:
             new_hand = [Card.from_dict(c) for c in game_state["your_hand"]]
             self.hands[self.player_id] = new_hand
-            
-            # Debug: Print hand size after update
-            print(f"Your hand now has {len(self.hands[self.player_id])} cards")
 
-        # Update last played cards
         if "last_played_cards" in game_state:
             self.last_played_cards = [Card.from_dict(c) for c in game_state["last_played_cards"]]
+            
+            # Check if 3D was played
+            if self.last_played_cards:
+                self.three_diamonds_played_in_game = any(
+                    c.rank == '3' and c.suit == 'd' for c in self.last_played_cards
+                )
+                if self.three_diamonds_played_in_game:
+                    print(f"DEBUG: 3D was played in the game!")
 
-        # Clear selection if it's not your turn or game is over
         if not self.is_my_turn or self.game_over:
             self.selected_cards = []
 
-        # Redraw the UI
         self.redraw()
         self.update_status()
 
@@ -431,19 +492,46 @@ class Big2App:
         canvas_width = self.canvas.winfo_width() or 1200
         canvas_height = self.canvas.winfo_height() or 800
 
-        positions = [(0.3, 0.15), (0.3, 0.35), (0.3, 0.55), (0.3, 0.75)]
-        card_w, card_h = 60, 90
-        scale = min(canvas_width/1200, canvas_height/800)
-        card_w *= scale
-        card_h *= scale
+        # Calculate dynamic card sizes
+        max_cards = max(self.hand_sizes) if self.hand_sizes else 13
+        
+        if max_cards > 20:
+            card_scale = 0.5
+            overlap = 0.65
+        elif max_cards > 15:
+            card_scale = 0.65
+            overlap = 0.7
+        elif max_cards > 10:
+            card_scale = 0.8
+            overlap = 0.75
+        else:
+            card_scale = 1.0
+            overlap = 0.8
+        
+        window_scale = min(canvas_width/1200, canvas_height/800)
+        final_scale = card_scale * window_scale
+        
+        card_w = 60 * final_scale
+        card_h = 90 * final_scale
+
+        # Positions based on number of players
+        if self.num_players == 2:
+            positions = [(0.3, 0.25), (0.3, 0.65)]
+        elif self.num_players == 3:
+            positions = [(0.3, 0.15), (0.3, 0.45), (0.3, 0.75)]
+        else:
+            positions = [(0.3, 0.15), (0.3, 0.35), (0.3, 0.55), (0.3, 0.75)]
 
         # Draw each player's hand
         for i in range(4):
+            if i >= len(positions):
+                continue
+                
             x_rel, y_rel = positions[i]
             x = x_rel * canvas_width
             y = y_rel * canvas_height
 
-            # Draw player label
+            # Player label
             label = f"Player {i}"
             if self.player_names and i < len(self.player_names):
                 label = self.player_names[i]
@@ -453,19 +541,28 @@ class Big2App:
                 label += " ←"
             self.canvas.create_text(x, y - card_h/2 - 20, text=label, font=("Arial", 12, "bold"), fill='white')
 
-            # Get hand for this player
+            # BIG WARNING for 3D requirement
+            if self.must_play_three_diamonds and i == self.player_id and self.current_player == i:
+                self.canvas.create_text(x, y - card_h/2 - 55, text="🔴🔴🔴 3♦ REQUIRED FIRST! 🔴🔴🔴", 
+                                       font=("Arial", 14, "bold"), fill='#FF0000')
+                self.canvas.create_text(x, y - card_h/2 - 80, text="Click 3♦ card first!", 
+                                       font=("Arial", 10, "bold"), fill='#FFA500')
+
             if i == self.player_id:
-                # Your hand - show all cards
                 hand = self.hands[i] if i < len(self.hands) else []
-                
-                # Draw hand size indicator
                 self.canvas.create_text(x, y + card_h/2 + 20, text=f"{len(hand)} cards", font=("Arial", 10), fill="white")
                 
                 if len(hand) > 0:
-                    total_width = (len(hand) - 1) * card_w * 0.8 + card_w
+                    total_width = (len(hand) - 1) * card_w * overlap + card_w
                     start_x = x - total_width / 2
+                    
+                    if start_x < 10:
+                        start_x = 10
+                    if start_x + total_width > canvas_width - 10:
+                        start_x = canvas_width - total_width - 10
+                    
                     for j, card in enumerate(hand):
-                        cx = start_x + j * card_w * 0.8
+                        cx = start_x + j * card_w * overlap
                         left = cx - card_w/2
                         top = y - card_h/2
                         right = cx + card_w/2
@@ -473,28 +570,26 @@ class Big2App:
                         rect = (left, top, right, bottom)
                         self.card_rects[i].append((rect, card))
                         
-                        # Only highlight if it's your turn and game is active
                         can_highlight = (self.game_started and not self.game_over and 
                                        self.current_player == self.player_id and not self.waiting_for_next_player)
                         highlight = can_highlight and card in self.selected_cards
-                        self.draw_card(cx, y, card, highlight=highlight, face_down=False)
+                        self.draw_card(cx, y, card, highlight=highlight, face_down=False, scale=final_scale)
                 else:
                     self.canvas.create_text(x, y, text="(empty hand)", font=("Arial", 14, "bold"), fill="white")
             else:
-                # Other players - show only count
                 count = self.hand_sizes[i] if i < len(self.hand_sizes) else 0
                 self.canvas.create_text(x, y + card_h/2 + 20, text=f"{count} cards", font=("Arial", 10), fill="white")
                 
                 if count > 0:
-                    # Draw stacked card backs (up to 3)
                     num_to_show = min(count, 3)
+                    card_scale_small = final_scale * 0.6
                     for j in range(num_to_show):
-                        offset_x = (j - (num_to_show - 1) / 2) * 15 * scale
-                        offset_y = (j - (num_to_show - 1) / 2) * 3 * scale
-                        self.draw_card(x + offset_x, y + offset_y, None, face_down=True, small=True)
+                        offset_x = (j - (num_to_show - 1) / 2) * 15 * final_scale
+                        offset_y = (j - (num_to_show - 1) / 2) * 3 * final_scale
+                        self.draw_card(x + offset_x, y + offset_y, None, face_down=True, scale=card_scale_small)
                     
                     if count > 3:
-                        self.canvas.create_text(x + 30*scale, y, text=f"+{count - 3}", font=("Arial", 10), fill="white")
+                        self.canvas.create_text(x + 30*final_scale, y, text=f"+{count - 3}", font=("Arial", int(10*final_scale)), fill="white")
                 else:
                     self.canvas.create_text(x, y, text="(empty)", font=("Arial", 12), fill="white")
 
@@ -502,23 +597,21 @@ class Big2App:
         if self.last_played_cards:
             x = 0.7 * canvas_width
             y = 0.45 * canvas_height
-            total_width = (len(self.last_played_cards) - 1) * card_w * 0.8 + card_w
+            total_width = (len(self.last_played_cards) - 1) * card_w * overlap + card_w
             start_x = x - total_width / 2
             for j, card in enumerate(self.last_played_cards):
-                cx = start_x + j * card_w * 0.8
-                self.draw_card(cx, y, card, highlight=False, face_down=False)
+                cx = start_x + j * card_w * overlap
+                self.draw_card(cx, y, card, highlight=False, face_down=False, scale=final_scale)
             self.canvas.create_text(x, y - card_h/2 - 10, text="Last Played:", font=("Arial", 12, "bold"), fill='white')
 
-        # Turn indicator
         if self.game_started and not self.game_over:
-            self.draw_turn_indicator()
+            self.draw_turn_indicator(positions)
         
         self.update_status()
 
-    def draw_turn_indicator(self):
+    def draw_turn_indicator(self, positions):
         if not self.game_started:
             return
-        positions = [(0.3, 0.15), (0.3, 0.35), (0.3, 0.55), (0.3, 0.75)]
         canvas_width = self.canvas.winfo_width() or 1200
         canvas_height = self.canvas.winfo_height() or 800
         if self.current_player < len(positions):
@@ -528,39 +621,65 @@ class Big2App:
             self.canvas.create_rectangle(x - 150, y - 60, x + 150, y + 60,
                                          outline='gold', width=3, dash=(5,5))
 
-    def draw_card(self, x, y, card, highlight=False, face_down=False, small=False):
+    def draw_card(self, x, y, card, highlight=False, face_down=False, scale=1.0):
         canvas_width = self.canvas.winfo_width() or 1200
         canvas_height = self.canvas.winfo_height() or 800
-        scale = min(canvas_width/1200, canvas_height/800)
-        w, h = 60, 90
-        if small:
-            scale *= 0.6
-        w *= scale
-        h *= scale
+        window_scale = min(canvas_width/1200, canvas_height/800)
+        
+        base_w, base_h = 60, 90
+        w = base_w * scale
+        h = base_h * scale
+        
+        if w < 20:
+            w = 20
+            h = 30
 
         if face_down:
             self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='blue', outline='white', width=2)
-            if not small:
+            if scale > 0.3:
                 self.canvas.create_text(x, y, text="?", font=('Arial', int(24*scale), 'bold'), fill='white')
             return
 
         if card is None:
-            # placeholder
             self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='gray', outline='white')
             return
 
-        color = 'black' if card.suit in ['s','c'] else 'red'
-        self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='white', outline=color, width=3)
-        if highlight:
-            self.canvas.create_rectangle(x-w/2+3, y-h/2+3, x+w/2-3, y+h/2-3, outline='yellow', width=4)
+        # Check if this is the 3 of diamonds
+        is_three_diamonds = (card.rank == '3' and card.suit == 'd')
+        must_play_3d = self.must_play_three_diamonds and is_three_diamonds and self.current_player == self.player_id
 
-        font_size = max(8, int(14*scale))
-        self.canvas.create_text(x-w/2+10*scale, y-h/2+10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
-        self.canvas.create_text(x+w/2-10*scale, y+h/2-10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
-        suit_sym = {'s':'♠', 'h':'♥', 'd':'♦', 'c':'♣'}[card.suit]
-        sym_size = max(10, int(20*scale))
-        self.canvas.create_text(x, y-h/2+25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
-        self.canvas.create_text(x, y+h/2-25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
+        color = 'black' if card.suit in ['s','c'] else 'red'
+        self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='white', outline=color, width=max(1, int(3*scale)))
+        
+        # SUPER PROMINENT 3D HIGHLIGHTING
+        if must_play_3d:
+            # Multiple pulsing borders
+            self.canvas.create_rectangle(x-w/2-8*scale, y-h/2-8*scale, x+w/2+8*scale, y+h/2+8*scale, 
+                                        outline='#FF0000', width=max(5, int(8*scale)))
+            self.canvas.create_rectangle(x-w/2-4*scale, y-h/2-4*scale, x+w/2+4*scale, y+h/2+4*scale, 
+                                        outline='#FFA500', width=max(3, int(5*scale)))
+            # Big text labels
+            if scale > 0.3:
+                self.canvas.create_text(x, y - h/2 - 18*scale, text="🔴 MUST PLAY FIRST!", 
+                                       font=('Arial', int(10*scale), 'bold'), fill='#FF0000')
+                self.canvas.create_text(x, y + h/2 + 18*scale, text="CLICK ME FIRST!", 
+                                       font=('Arial', int(9*scale), 'bold'), fill='#FFA500')
+        
+        # Selection highlight
+        if highlight:
+            self.canvas.create_rectangle(x-w/2-4*scale, y-h/2-4*scale, x+w/2+4*scale, y+h/2+4*scale, 
+                                        outline='yellow', width=max(3, int(6*scale)))
+            self.canvas.create_text(x, y + h/2 - 8*scale, text="✓ SELECTED", 
+                                   font=('Arial', int(10*scale), 'bold'), fill='yellow')
+
+        if scale > 0.25:
+            font_size = max(6, int(14*scale))
+            self.canvas.create_text(x-w/2+10*scale, y-h/2+10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
+            self.canvas.create_text(x+w/2-10*scale, y+h/2-10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
+            suit_sym = {'s':'♠', 'h':'♥', 'd':'♦', 'c':'♣'}[card.suit]
+            sym_size = max(8, int(20*scale))
+            self.canvas.create_text(x, y-h/2+25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
+            self.canvas.create_text(x, y+h/2-25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
 
     def update_status(self):
         if not self.connected:
@@ -575,14 +694,17 @@ class Big2App:
             turn_player = self.current_player
             is_your_turn = (self.player_id == turn_player)
             if is_your_turn:
-                turn_text = "🎯 YOUR TURN - Select cards and click Play"
-                self.status_label.config(
-                    text=f"{turn_text} | Passes: {self.passes} | Your cards: {len(self.hands[self.player_id]) if self.player_id is not None else '?'}"
-                )
+                if self.must_play_three_diamonds:
+                    self.status_label.config(
+                        text=f"🔴🔴🔴 MUST PLAY 3♦ FIRST! Click the 3♦ card! 🔴🔴🔴"
+                    )
+                else:
+                    self.status_label.config(
+                        text=f"🎯 YOUR TURN | Cards: {len(self.hands[self.player_id]) if self.player_id is not None else '?'}"
+                    )
             else:
-                turn_text = f"Player {turn_player}'s turn"
                 self.status_label.config(
-                    text=f"{turn_text} | Passes: {self.passes} | Your cards: {len(self.hands[self.player_id]) if self.player_id is not None else '?'}"
+                    text=f"Player {turn_player}'s turn | Your cards: {len(self.hands[self.player_id]) if self.player_id is not None else '?'}"
                 )
 
 if __name__ == "__main__":
