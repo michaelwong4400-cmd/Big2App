@@ -41,7 +41,7 @@ class GameRoom:
             "game_started": False,
             "waiting_for_players": True
         }
-        self.min_players = 2
+        self.min_players = 4
         self.max_players = 4
     
     def add_player(self, websocket, player_name):
@@ -236,7 +236,7 @@ class GameRoom:
         self.game_state["passes"] += 1
         
         num_players = len(self.players)
-        if self.game_state["passes"] >= num_players:
+        if self.game_state["passes"] >= num_players - 1:
             self.game_state["previous_move"] = None
             self.game_state["passes"] = 0
         
