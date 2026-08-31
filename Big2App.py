@@ -70,7 +70,6 @@ class Big2App:
         self.hand_sizes = [0, 0, 0, 0]
         self.player_names = []
         self.is_my_turn = False
-        self.num_players = 4  # Default
 
         # Canvas and UI
         self.canvas = tk.Canvas(self.root, bg='green', width=1200, height=800)
@@ -236,15 +235,14 @@ class Big2App:
 
     # ---------- Event Handlers ----------
     def on_click(self, event):
+        # Do not allow clicks if game is not ready or not your turn
         if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
             return
-        
         if self.player_id is None:
             return
-            
         if self.current_player != self.player_id:
             return
-            
+
         x = event.x
         y = event.y
 
@@ -262,46 +260,45 @@ class Big2App:
     def play_selected(self):
         if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
             return
-        
         if self.player_id is None:
             return
-            
         if self.current_player != self.player_id:
             messagebox.showinfo("Not Your Turn", "Please wait for your turn!")
             return
-            
         if not self.selected_cards:
             messagebox.showerror("No Cards", "Please select cards to play!")
             return
 
         cards_data = [c.to_dict() for c in self.selected_cards]
-        
+
+        # Disable buttons to prevent double‑clicking
+        self.play_btn.config(state='disabled')
+        self.pass_btn.config(state='disabled')
+
+        # Send the move to the server – do NOT change waiting flag here
         self.send_to_server("play", {
             "player_id": self.player_id,
             "selected_cards": cards_data
         })
-        
-        self.play_btn.config(state='disabled')
-        self.pass_btn.config(state='disabled')
 
     def pass_turn(self):
         if not self.connected or self.game_over or self.waiting_for_next_player or not self.game_started:
             return
-        
         if self.player_id is None:
             return
-            
         if self.current_player != self.player_id:
             messagebox.showinfo("Not Your Turn", "Please wait for your turn!")
             return
-            
+
         self.send_to_server("pass", {
             "player_id": self.player_id
         })
+        # After passing, we expect the turn to change, so we set waiting flag
         self.waiting_for_next_player = True
         self.redraw()
 
     def next_player_manual(self):
+        # Only used in local/offline fallback
         if not self.connected:
             if self.game_over:
                 return
@@ -349,9 +346,11 @@ class Big2App:
             self.update_game_state(game_state)
 
         elif msg_type == "error":
+            # Handle invalid move – allow the player to retry immediately
             error_msg = data.get("message", "Unknown error")
             messagebox.showerror("Invalid Play", error_msg)
-            
+
+            # Reset the waiting state so the player can try again
             self.waiting_for_next_player = False
             self.selected_cards = []
             self.play_btn.config(state='normal')
@@ -360,19 +359,20 @@ class Big2App:
 
     def update_game_state(self, game_state):
         self.game_started = game_state.get("game_started", False)
-        
+
         if not self.game_started:
             self.show_waiting_screen()
             return
 
+        # Update core state
         self.current_player = game_state["current_player"]
         self.previous_move = game_state["previous_move"]
         self.passes = game_state["passes"]
         self.game_over = game_state["game_over"]
         self.hand_sizes = game_state.get("hand_sizes", [0, 0, 0, 0])
         self.player_names = game_state.get("player_names", [])
-        self.num_players = game_state.get("num_players", 4)
-        
+
+        # Determine if it's our turn
         if self.player_id is not None:
             self.is_my_turn = (self.current_player == self.player_id)
             if self.is_my_turn:
@@ -384,13 +384,16 @@ class Big2App:
                 self.play_btn.config(state='disabled')
                 self.pass_btn.config(state='disabled')
 
+        # Update our own hand
         if "your_hand" in game_state and self.player_id is not None:
             new_hand = [Card.from_dict(c) for c in game_state["your_hand"]]
             self.hands[self.player_id] = new_hand
 
+        # Update last played cards
         if "last_played_cards" in game_state:
             self.last_played_cards = [Card.from_dict(c) for c in game_state["last_played_cards"]]
 
+        # Clear selection after a successful move
         self.selected_cards = []
 
         self.redraw()
@@ -419,59 +422,17 @@ class Big2App:
         canvas_width = self.canvas.winfo_width() or 1200
         canvas_height = self.canvas.winfo_height() or 800
 
-        # Calculate dynamic card sizes based on number of cards and players
-        max_cards = max(self.hand_sizes) if self.hand_sizes else 13
-        
-        # Base card dimensions
-        base_card_w, base_card_h = 60, 90
-        
-        # Calculate scale based on hand size
-        # For 13+ cards, make cards smaller
-        if max_cards > 20:
-            card_scale = 0.5  # Very small for 2 players (26 cards)
-        elif max_cards > 15:
-            card_scale = 0.65  # Small for 3 players (17-18 cards)
-        elif max_cards > 10:
-            card_scale = 0.8  # Normal for 4 players (13 cards)
-        else:
-            card_scale = 1.0  # Large for late game
-        
-        # Also scale based on window size
-        window_scale = min(canvas_width/1200, canvas_height/800)
-        final_scale = card_scale * window_scale
-        
-        card_w = base_card_w * final_scale
-        card_h = base_card_h * final_scale
-        
-        # Calculate overlap based on number of cards
-        # More cards = more overlap to fit on screen
-        if max_cards > 20:
-            overlap = 0.65  # 65% overlap for 26 cards
-        elif max_cards > 15:
-            overlap = 0.7
-        elif max_cards > 10:
-            overlap = 0.75
-        else:
-            overlap = 0.8
+        positions = [(0.3, 0.15), (0.3, 0.35), (0.3, 0.55), (0.3, 0.75)]
+        card_w, card_h = 60, 90
+        scale = min(canvas_width/1200, canvas_height/800)
+        card_w *= scale
+        card_h *= scale
 
-        # Positions for player hands - adjust for number of players
-        if self.num_players == 2:
-            positions = [(0.3, 0.25), (0.3, 0.65)]  # Top and bottom for 2 players
-        elif self.num_players == 3:
-            positions = [(0.3, 0.15), (0.3, 0.45), (0.3, 0.75)]
-        else:
-            positions = [(0.3, 0.15), (0.3, 0.35), (0.3, 0.55), (0.3, 0.75)]
-
-        # Draw each player's hand
         for i in range(4):
-            if i >= len(positions):
-                continue
-                
             x_rel, y_rel = positions[i]
             x = x_rel * canvas_width
             y = y_rel * canvas_height
 
-            # Draw player label
             label = f"Player {i}"
             if self.player_names and i < len(self.player_names):
                 label = self.player_names[i]
@@ -484,70 +445,60 @@ class Big2App:
             if i == self.player_id:
                 hand = self.hands[i] if i < len(self.hands) else []
                 self.canvas.create_text(x, y + card_h/2 + 20, text=f"{len(hand)} cards", font=("Arial", 10), fill="white")
-                
+
                 if len(hand) > 0:
-                    total_width = (len(hand) - 1) * card_w * overlap + card_w
+                    total_width = (len(hand) - 1) * card_w * 0.8 + card_w
                     start_x = x - total_width / 2
-                    
-                    # Adjust start_x if cards would go off screen
-                    if start_x < 10:
-                        start_x = 10
-                    if start_x + total_width > canvas_width - 10:
-                        start_x = canvas_width - total_width - 10
-                    
                     for j, card in enumerate(hand):
-                        cx = start_x + j * card_w * overlap
+                        cx = start_x + j * card_w * 0.8
                         left = cx - card_w/2
                         top = y - card_h/2
                         right = cx + card_w/2
                         bottom = y + card_h/2
                         rect = (left, top, right, bottom)
                         self.card_rects[i].append((rect, card))
-                        
-                        can_highlight = (self.game_started and not self.game_over and 
+
+                        can_highlight = (self.game_started and not self.game_over and
                                        self.current_player == self.player_id and not self.waiting_for_next_player)
                         highlight = can_highlight and card in self.selected_cards
-                        self.draw_card(cx, y, card, highlight=highlight, face_down=False, scale=final_scale)
+                        self.draw_card(cx, y, card, highlight=highlight, face_down=False)
                 else:
                     self.canvas.create_text(x, y, text="(empty hand)", font=("Arial", 14, "bold"), fill="white")
             else:
                 count = self.hand_sizes[i] if i < len(self.hand_sizes) else 0
                 self.canvas.create_text(x, y + card_h/2 + 20, text=f"{count} cards", font=("Arial", 10), fill="white")
-                
+
                 if count > 0:
                     num_to_show = min(count, 3)
-                    card_scale_small = final_scale * 0.6
-                    small_w = base_card_w * card_scale_small
-                    small_h = base_card_h * card_scale_small
                     for j in range(num_to_show):
-                        offset_x = (j - (num_to_show - 1) / 2) * 15 * final_scale
-                        offset_y = (j - (num_to_show - 1) / 2) * 3 * final_scale
-                        self.draw_card(x + offset_x, y + offset_y, None, face_down=True, scale=card_scale_small)
-                    
+                        offset_x = (j - (num_to_show - 1) / 2) * 15 * scale
+                        offset_y = (j - (num_to_show - 1) / 2) * 3 * scale
+                        self.draw_card(x + offset_x, y + offset_y, None, face_down=True, small=True)
+
                     if count > 3:
-                        self.canvas.create_text(x + 30*final_scale, y, text=f"+{count - 3}", font=("Arial", int(10*final_scale)), fill="white")
+                        self.canvas.create_text(x + 30*scale, y, text=f"+{count - 3}", font=("Arial", 10), fill="white")
                 else:
                     self.canvas.create_text(x, y, text="(empty)", font=("Arial", 12), fill="white")
 
-        # Draw last played cards
         if self.last_played_cards:
             x = 0.7 * canvas_width
             y = 0.45 * canvas_height
-            total_width = (len(self.last_played_cards) - 1) * card_w * overlap + card_w
+            total_width = (len(self.last_played_cards) - 1) * card_w * 0.8 + card_w
             start_x = x - total_width / 2
             for j, card in enumerate(self.last_played_cards):
-                cx = start_x + j * card_w * overlap
-                self.draw_card(cx, y, card, highlight=False, face_down=False, scale=final_scale)
+                cx = start_x + j * card_w * 0.8
+                self.draw_card(cx, y, card, highlight=False, face_down=False)
             self.canvas.create_text(x, y - card_h/2 - 10, text="Last Played:", font=("Arial", 12, "bold"), fill='white')
 
         if self.game_started and not self.game_over:
-            self.draw_turn_indicator(positions)
-        
+            self.draw_turn_indicator()
+
         self.update_status()
 
-    def draw_turn_indicator(self, positions):
+    def draw_turn_indicator(self):
         if not self.game_started:
             return
+        positions = [(0.3, 0.15), (0.3, 0.35), (0.3, 0.55), (0.3, 0.75)]
         canvas_width = self.canvas.winfo_width() or 1200
         canvas_height = self.canvas.winfo_height() or 800
         if self.current_player < len(positions):
@@ -557,24 +508,19 @@ class Big2App:
             self.canvas.create_rectangle(x - 150, y - 60, x + 150, y + 60,
                                          outline='gold', width=3, dash=(5,5))
 
-    def draw_card(self, x, y, card, highlight=False, face_down=False, scale=1.0):
+    def draw_card(self, x, y, card, highlight=False, face_down=False, small=False):
         canvas_width = self.canvas.winfo_width() or 1200
         canvas_height = self.canvas.winfo_height() or 800
-        window_scale = min(canvas_width/1200, canvas_height/800)
-        
-        # Base card dimensions
-        base_w, base_h = 60, 90
-        w = base_w * scale
-        h = base_h * scale
-        
-        # Ensure minimum card size
-        if w < 20:
-            w = 20
-            h = 30
+        scale = min(canvas_width/1200, canvas_height/800)
+        w, h = 60, 90
+        if small:
+            scale *= 0.6
+        w *= scale
+        h *= scale
 
         if face_down:
             self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='blue', outline='white', width=2)
-            if scale > 0.3:
+            if not small:
                 self.canvas.create_text(x, y, text="?", font=('Arial', int(24*scale), 'bold'), fill='white')
             return
 
@@ -583,20 +529,17 @@ class Big2App:
             return
 
         color = 'black' if card.suit in ['s','c'] else 'red'
-        self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='white', outline=color, width=max(1, int(3*scale)))
-        
+        self.canvas.create_rectangle(x-w/2, y-h/2, x+w/2, y+h/2, fill='white', outline=color, width=3)
         if highlight:
-            self.canvas.create_rectangle(x-w/2+3*scale, y-h/2+3*scale, x+w/2-3*scale, y+h/2-3*scale, outline='yellow', width=max(2, int(4*scale)))
+            self.canvas.create_rectangle(x-w/2+3, y-h/2+3, x+w/2-3, y+h/2-3, outline='yellow', width=4)
 
-        # Only draw text if cards are large enough to read
-        if scale > 0.25:
-            font_size = max(6, int(14*scale))
-            self.canvas.create_text(x-w/2+10*scale, y-h/2+10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
-            self.canvas.create_text(x+w/2-10*scale, y+h/2-10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
-            suit_sym = {'s':'♠', 'h':'♥', 'd':'♦', 'c':'♣'}[card.suit]
-            sym_size = max(8, int(20*scale))
-            self.canvas.create_text(x, y-h/2+25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
-            self.canvas.create_text(x, y+h/2-25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
+        font_size = max(8, int(14*scale))
+        self.canvas.create_text(x-w/2+10*scale, y-h/2+10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
+        self.canvas.create_text(x+w/2-10*scale, y+h/2-10*scale, text=card.rank, font=('Arial', font_size, 'bold'), fill=color)
+        suit_sym = {'s':'♠', 'h':'♥', 'd':'♦', 'c':'♣'}[card.suit]
+        sym_size = max(10, int(20*scale))
+        self.canvas.create_text(x, y-h/2+25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
+        self.canvas.create_text(x, y+h/2-25*scale, text=suit_sym, font=('Arial', sym_size), fill=color)
 
     def update_status(self):
         if not self.connected:
